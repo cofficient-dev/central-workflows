@@ -23,6 +23,53 @@ jobs:
             echo "⚠️ Diff truncated to 400KB"
           fi
 
+      - name: Parse valid diff lines
+        run: |
+          python3 << 'EOF'
+          import re, json
+
+          valid_lines = []  # [{path, line}]
+          current_file = None
+          current_line = None
+
+          with open("diff.txt") as f:
+            for raw in f:
+              line = raw.rstrip("\n")
+
+              # Detect file path from diff header
+              m = re.match(r'^\+\+\+ b/(.+)$', line)
+              if m:
+                current_file = m.group(1)
+                current_line = None
+                continue
+
+              # Detect hunk header e.g. @@ -10,7 +10,9 @@
+              m = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+              if m:
+                current_line = int(m.group(1))
+                continue
+
+              if current_file is None or current_line is None:
+                continue
+
+              if line.startswith('+'):
+                # Added line — valid for comment
+                valid_lines.append({"path": current_file, "line": current_line})
+                current_line += 1
+              elif line.startswith('-'):
+                # Removed line — do not increment new-file line counter
+                pass
+              else:
+                # Context line
+                valid_lines.append({"path": current_file, "line": current_line})
+                current_line += 1
+
+          with open("valid_lines.json", "w") as f:
+            json.dump(valid_lines, f)
+
+          print(f"Found {len(valid_lines)} valid commentable lines across {len(set(v['path'] for v in valid_lines))} files")
+          EOF
+
       - name: AI Review
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -31,11 +78,12 @@ jobs:
           jq -n \
             --arg model "$MODEL" \
             --rawfile diff diff.txt \
+            --rawfile valid_lines valid_lines.json \
             '{
               model: $model,
               messages: [{
                 role: "user",
-                content: ("You are an expert code reviewer. Review this PR diff.\n\nFocus on:\n1. Bugs or logic errors\n2. Security issues\n3. Code quality\n4. Missing error handling\n5. Suggested improvements\n\nBe concise. Use markdown.\n\nDiff:\n" + $diff)
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only reference lines from this exact list of valid file+line combinations (these are the only lines GitHub will accept comments on):\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences max\n\nDiff:\n" + $diff)
               }]
             }' > payload.json
 
@@ -50,10 +98,15 @@ jobs:
             exit 1
           fi
 
-          echo "$RESPONSE" | jq -r '.choices[0].message.content' > review.txt
-          cat review.txt
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' > review_raw.txt
+          cat review_raw.txt
 
-      - name: Post review comment
+          # Strip any markdown fences the model may have added
+          sed 's/```json//g; s/```//g' review_raw.txt | tr -d '\r' > review.json
+          echo "Parsed JSON:"
+          cat review.json
+
+      - name: Post inline review comments
         if: success()
         uses: actions/github-script@v7
         env:
@@ -61,11 +114,56 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const review = fs.readFileSync('review.txt', 'utf8');
             const model = process.env.MODEL;
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+
+            // Load valid lines for server-side validation
+            const validLines = JSON.parse(fs.readFileSync('valid_lines.json', 'utf8'));
+            const validSet = new Set(validLines.map(v => `${v.path}:${v.line}`));
+
+            let review;
+            try {
+              review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+            } catch (e) {
+              console.error('Failed to parse review JSON:', e.message);
+              const raw = fs.readFileSync('review_raw.txt', 'utf8');
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## 🤖 AI Code Review (${model})\n\n${raw}`
+              });
+              return;
+            }
+
+            const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🤖 AI Code Review (${model})\n\n${review}`
+              pull_number: context.issue.number
+            });
+            const commitId = pr.data.head.sha;
+
+            // Filter to only comments whose path+line exist in the diff
+            const validComments = (review.comments || []).filter(c => {
+              const key = `${c.path}:${c.line}`;
+              if (!validSet.has(key)) {
+                console.warn(`Skipping invalid line reference: ${key}`);
+                return false;
+              }
+              return true;
+            });
+
+            console.log(`Posting ${validComments.length} inline comments (${(review.comments || []).length - validComments.length} skipped as invalid)`);
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              commit_id: commitId,
+              body: `## 🤖 AI Code Review (${model})\n\n${review.summary || ''}`,
+              event: 'COMMENT',
+              comments: validComments.map(c => ({
+                path: c.path,
+                line: c.line,
+                body: c.body
+              }))
             });
