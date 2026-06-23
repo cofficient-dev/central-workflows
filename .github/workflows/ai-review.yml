@@ -1,4 +1,3 @@
-# .github/workflows/ai-review.yml
 name: AI Code Review
 on:
   workflow_call:
@@ -29,22 +28,21 @@ jobs:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           MODEL: "glm-5.2:cloud"
         run: |
-          DIFF=$(cat diff.txt)
+          jq -n \
+            --arg model "$MODEL" \
+            --rawfile diff diff.txt \
+            '{
+              model: $model,
+              messages: [{
+                role: "user",
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nFocus on:\n1. Bugs or logic errors\n2. Security issues\n3. Code quality\n4. Missing error handling\n5. Suggested improvements\n\nBe concise. Use markdown.\n\nDiff:\n" + $diff)
+              }]
+            }' > payload.json
 
           RESPONSE=$(curl -s https://ollama.com/v1/chat/completions \
             -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg model "$MODEL" \
-              --arg diff "$DIFF" \
-              '{
-                model: $model,
-                messages: [{
-                  role: "user",
-                  content: ("You are an expert code reviewer. Review this PR diff.\n\nFocus on:\n1. Bugs or logic errors\n2. Security issues\n3. Code quality\n4. Missing error handling\n5. Suggested improvements\n\nBe concise. Use markdown.\n\nDiff:\n" + $diff)
-                }]
-              }'
-            )")
+            -d @payload.json)
 
           ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
           if [ -n "$ERROR" ]; then
