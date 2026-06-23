@@ -1,0 +1,73 @@
+# .github/workflows/ai-review.yml
+name: AI Code Review
+on:
+  workflow_call:
+    secrets:
+      OLLAMA_API_KEY:
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > diff.txt
+          SIZE=$(wc -c < diff.txt)
+          echo "Diff size: $SIZE bytes"
+          if [ $SIZE -gt 400000 ]; then
+            head -c 400000 diff.txt > diff_trimmed.txt && mv diff_trimmed.txt diff.txt
+            echo "⚠️ Diff truncated to 400KB"
+          fi
+
+      - name: AI Review
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          MODEL: "glm-5.2:cloud"
+        run: |
+          DIFF=$(cat diff.txt)
+
+          RESPONSE=$(curl -s https://ollama.com/v1/chat/completions \
+            -H "Authorization: Bearer $OLLAMA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg model "$MODEL" \
+              --arg diff "$DIFF" \
+              '{
+                model: $model,
+                messages: [{
+                  role: "user",
+                  content: ("You are an expert code reviewer. Review this PR diff.\n\nFocus on:\n1. Bugs or logic errors\n2. Security issues\n3. Code quality\n4. Missing error handling\n5. Suggested improvements\n\nBe concise. Use markdown.\n\nDiff:\n" + $diff)
+                }]
+              }'
+            )")
+
+          ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+          if [ -n "$ERROR" ]; then
+            echo "API error: $ERROR"
+            exit 1
+          fi
+
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' > review.txt
+          cat review.txt
+
+      - name: Post review comment
+        if: success()
+        uses: actions/github-script@v7
+        env:
+          MODEL: "glm-5.2:cloud"
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('review.txt', 'utf8');
+            const model = process.env.MODEL;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🤖 AI Code Review (${model})\n\n${review}`
+            });
