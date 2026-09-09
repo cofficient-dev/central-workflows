@@ -51,10 +51,15 @@ jobs:
             for raw in f:
               line = raw.rstrip("\n")
 
-              # Detect file path from diff header
-              m = re.match(r'^\+\+\+ b/(.+)$', line)
+              # Detect file path from diff header.
+              # git appends a trailing tab to this line when the path contains a space, so a
+              # greedy capture pulls the tab into the filename. That corrupted path then went
+              # into valid_lines, the model was told it was valid and commented on it, the
+              # validation below compared against the same corrupted value and let it through,
+              # and GitHub rejected the whole review. Strip the separator.
+              m = re.match(r'^\+\+\+ b/(.*)$', line)
               if m:
-                current_file = m.group(1)
+                current_file = m.group(1).rstrip('\t')
                 current_line = None
                 continue
 
@@ -176,16 +181,34 @@ jobs:
 
             console.log(`Posting ${validComments.length} inline comments (${(review.comments || []).length - validComments.length} skipped as invalid)`);
 
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              commit_id: commitId,
-              body: `## 🤖 AI Code Review (${model})\n\n${review.summary || ''}`,
-              event: 'COMMENT',
-              comments: validComments.map(c => ({
-                path: c.path,
-                line: c.line,
-                body: c.body
-              }))
-            });
+            const reviewBody = `## 🤖 AI Code Review (${model})\n\n${review.summary || ''}`;
+
+            // createReview is all or nothing: one path GitHub will not accept discards the
+            // entire review, summary included. Fall back to posting the summary and the
+            // findings as a plain comment so the output is never silently lost.
+            try {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                commit_id: commitId,
+                body: reviewBody,
+                event: 'COMMENT',
+                comments: validComments.map(c => ({
+                  path: c.path,
+                  line: c.line,
+                  body: c.body
+                }))
+              });
+            } catch (e) {
+              console.error(`createReview failed: ${e.message}`);
+              const rendered = validComments
+                .map(c => `- **${c.path}:${c.line}**\n  ${c.body.replace(/\n/g, '\n  ')}`)
+                .join('\n\n');
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `${reviewBody}\n\n> Inline comments could not be attached (${e.message}), so they are listed here.\n\n${rendered}`
+              });
+            }
