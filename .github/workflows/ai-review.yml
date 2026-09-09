@@ -8,6 +8,8 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # A review is advisory, so it should never occupy a runner for the multi hour default.
+    timeout-minutes: 25
     # Single source of truth. This was previously declared twice, once for the API call and
     # once for the comment header, and the two drifted: reviews ran on glm-5.2:cloud while
     # the posted header claimed glm-5.3-flash. Declare it here so the two cannot disagree.
@@ -99,10 +101,20 @@ jobs:
               }]
             }' > payload.json
 
-          RESPONSE=$(curl -s https://ollama.com/v1/chat/completions \
+          # --max-time bounds the call. An invalid model tag does not get rejected quickly, it
+          # hangs, and with no timeout the step sat for minutes against the job's multi hour
+          # default. --fail-with-body still gives us the response body on an HTTP error so the
+          # check below can report it.
+          RESPONSE=$(curl -s --max-time 900 --fail-with-body https://ollama.com/v1/chat/completions \
             -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @payload.json)
+            -d @payload.json) || CURL_EXIT=$?
+
+          if [ -n "${CURL_EXIT:-}" ]; then
+            echo "curl failed with exit $CURL_EXIT after up to 900s. Response body, if any:"
+            echo "$RESPONSE"
+            exit 1
+          fi
 
           ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
           if [ -n "$ERROR" ]; then
