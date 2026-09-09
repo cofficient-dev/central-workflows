@@ -18,11 +18,13 @@ jobs:
       # model in the API request, so a prettified name here fails the request outright.
       MODEL: "glm-5.3-flash:cloud"
       # Diff cap in bytes. The prompt carries the diff plus valid_lines.json, and that JSON
-      # repeats the file path for every commentable line, so it grows at roughly the same
-      # rate as the diff itself. Budget about 2 bytes of prompt per byte of diff, at roughly
-      # 3.5 chars per token, and 1.5MB lands near 850K tokens. That leaves headroom inside
-      # glm-5.3-flash's 1M context for the response. Raise this only alongside the model.
-      MAX_DIFF_BYTES: "1500000"
+      # repeats the full file path for every commentable line, so it is not a rounding error:
+      # measured on a real 137KB diff it came to 229KB, ie 62% of the prompt and 1.67x the
+      # diff. Budget about 2.7 bytes of prompt per byte of diff, at roughly 3.5 chars per
+      # token, so 1MB lands near 760K tokens and leaves room for the response inside a 1M
+      # context. Compressing valid_lines to per-file line lists would cut the prompt by about
+      # 60% and let this rise considerably.
+      MAX_DIFF_BYTES: "1000000"
     steps:
       - uses: actions/checkout@v7
         with:
