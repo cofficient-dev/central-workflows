@@ -17,14 +17,18 @@ jobs:
       # Must be the exact Ollama tag, including the :cloud suffix. This value is sent as the
       # model in the API request, so a prettified name here fails the request outright.
       MODEL: "glm-5.3-flash:cloud"
-      # Diff cap in bytes, set by latency rather than context window. The 1M context is not
-      # the binding constraint: glm-5.3-flash took 707s on a 366KB prompt, about 520 bytes of
-      # prompt per second, so the 900s curl budget only covers roughly 460KB of prompt.
-      # valid_lines is now grouped per file and adds under 10% on top of the diff, so 500KB of
-      # diff is about what can actually finish in time. Truncating to something the model can
-      # process beats sending everything and timing out with nothing to show.
-      # That throughput figure is a single measurement, so treat it as an estimate. If large
-      # PRs start failing on curl exit 28, lower this before raising the timeout.
+      # Diff cap in bytes, set by latency rather than context window. The 1M context is not the
+      # binding constraint, the 900s curl budget is. Two measurements of glm-5.3-flash on the
+      # same content:
+      #   366KB prompt -> 707s (518 bytes/s)
+      #   149KB prompt -> 179s (830 bytes/s)
+      # Throughput degrades as the prompt grows, so latency is superlinear and the faster
+      # small-prompt figure must NOT be used to extrapolate. Sizing off the slower 518 bytes/s
+      # gives roughly 460KB of prompt inside 900s, and valid_lines now adds under 10% on top of
+      # the diff, hence 500KB. Deliberately conservative because of that superlinearity.
+      # Truncating to something the model can finish beats sending everything and timing out
+      # with nothing to show. If large PRs fail on curl exit 28, lower this before raising the
+      # timeout.
       MAX_DIFF_BYTES: "500000"
     steps:
       - uses: actions/checkout@v7
