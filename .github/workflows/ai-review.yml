@@ -8,6 +8,17 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    # Single source of truth. This was previously declared twice, once for the API call and
+    # once for the comment header, and the two drifted: reviews ran on glm-5.2:cloud while
+    # the posted header claimed glm-5.3-flash. Declare it here so the two cannot disagree.
+    env:
+      MODEL: "glm-5.3-flash"
+      # Diff cap in bytes. The prompt carries the diff plus valid_lines.json, and that JSON
+      # repeats the file path for every commentable line, so it grows at roughly the same
+      # rate as the diff itself. Budget about 2 bytes of prompt per byte of diff, at roughly
+      # 3.5 chars per token, and 1.5MB lands near 850K tokens. That leaves headroom inside
+      # glm-5.3-flash's 1M context for the response. Raise this only alongside the model.
+      MAX_DIFF_BYTES: "1500000"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -17,10 +28,10 @@ jobs:
         run: |
           git diff origin/${{ github.base_ref }}...HEAD > diff.txt
           SIZE=$(wc -c < diff.txt)
-          echo "Diff size: $SIZE bytes"
-          if [ $SIZE -gt 400000 ]; then
-            head -c 400000 diff.txt > diff_trimmed.txt && mv diff_trimmed.txt diff.txt
-            echo "⚠️ Diff truncated to 400KB"
+          echo "Diff size: $SIZE bytes (cap $MAX_DIFF_BYTES)"
+          if [ $SIZE -gt $MAX_DIFF_BYTES ]; then
+            head -c $MAX_DIFF_BYTES diff.txt > diff_trimmed.txt && mv diff_trimmed.txt diff.txt
+            echo "::warning::Diff exceeded $MAX_DIFF_BYTES bytes and was truncated. Review is partial."
           fi
 
       - name: Parse valid diff lines
@@ -73,7 +84,6 @@ jobs:
       - name: AI Review
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          MODEL: "glm-5.2:cloud"
         run: |
           jq -n \
             --arg model "$MODEL" \
@@ -83,7 +93,7 @@ jobs:
               model: $model,
               messages: [{
                 role: "user",
-                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only reference lines from this exact list of valid file+line combinations (these are the only lines GitHub will accept comments on):\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR\n- The ONLY exception: if an unchanged file is directly impacted by the PR changes (e.g. a caller of a modified function, a file that now breaks because of these changes), you may mention it in the summary — but do NOT post inline comments on unchanged files\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences max\n\nDiff:\n" + $diff)
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only reference lines from this exact list of valid file+line combinations (these are the only lines GitHub will accept comments on):\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
               }]
             }' > payload.json
 
@@ -109,8 +119,6 @@ jobs:
       - name: Post inline review comments
         if: success()
         uses: actions/github-script@v7
-        env:
-          MODEL: "glm-5.3-flash"
         with:
           script: |
             const fs = require('fs');
