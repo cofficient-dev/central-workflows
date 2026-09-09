@@ -17,14 +17,15 @@ jobs:
       # Must be the exact Ollama tag, including the :cloud suffix. This value is sent as the
       # model in the API request, so a prettified name here fails the request outright.
       MODEL: "glm-5.3-flash:cloud"
-      # Diff cap in bytes. The prompt carries the diff plus valid_lines.json, and that JSON
-      # repeats the full file path for every commentable line, so it is not a rounding error:
-      # measured on a real 137KB diff it came to 229KB, ie 62% of the prompt and 1.67x the
-      # diff. Budget about 2.7 bytes of prompt per byte of diff, at roughly 3.5 chars per
-      # token, so 1MB lands near 760K tokens and leaves room for the response inside a 1M
-      # context. Compressing valid_lines to per-file line lists would cut the prompt by about
-      # 60% and let this rise considerably.
-      MAX_DIFF_BYTES: "1000000"
+      # Diff cap in bytes, set by latency rather than context window. The 1M context is not
+      # the binding constraint: glm-5.3-flash took 707s on a 366KB prompt, about 520 bytes of
+      # prompt per second, so the 900s curl budget only covers roughly 460KB of prompt.
+      # valid_lines is now grouped per file and adds under 10% on top of the diff, so 500KB of
+      # diff is about what can actually finish in time. Truncating to something the model can
+      # process beats sending everything and timing out with nothing to show.
+      # That throughput figure is a single measurement, so treat it as an estimate. If large
+      # PRs start failing on curl exit 28, lower this before raising the timeout.
+      MAX_DIFF_BYTES: "500000"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -45,7 +46,12 @@ jobs:
           python3 << 'EOF'
           import re, json
 
-          valid_lines = []  # [{path, line}]
+          # {path: [line, ...]} rather than [{path, line}, ...]. The flat form repeated the
+          # full file path on every single line: measured on a 137KB diff it produced 229KB of
+          # JSON, 62% of the whole prompt and larger than the code under review. Grouping by
+          # file drops that to a few percent. Kept as explicit line numbers, not ranges, so the
+          # model only has to pick a value from a list rather than expand a range correctly.
+          valid_lines = {}  # {path: [line, ...]}
           current_file = None
           current_line = None
 
@@ -75,21 +81,23 @@ jobs:
                 continue
 
               if line.startswith('+'):
-                # Added line — valid for comment
-                valid_lines.append({"path": current_file, "line": current_line})
+                # Added line, valid for comment
+                valid_lines.setdefault(current_file, []).append(current_line)
                 current_line += 1
               elif line.startswith('-'):
-                # Removed line — do not increment new-file line counter
+                # Removed line, do not increment new-file line counter
                 pass
               else:
                 # Context line
-                valid_lines.append({"path": current_file, "line": current_line})
+                valid_lines.setdefault(current_file, []).append(current_line)
                 current_line += 1
 
           with open("valid_lines.json", "w") as f:
-            json.dump(valid_lines, f)
+            json.dump(valid_lines, f, separators=(',', ':'))
 
-          print(f"Found {len(valid_lines)} valid commentable lines across {len(set(v['path'] for v in valid_lines))} files")
+          total = sum(len(v) for v in valid_lines.values())
+          size = len(json.dumps(valid_lines, separators=(',', ':')))
+          print(f"Found {total} valid commentable lines across {len(valid_lines)} files ({size} bytes of JSON)")
           EOF
 
       - name: AI Review
@@ -104,7 +112,7 @@ jobs:
               model: $model,
               messages: [{
                 role: "user",
-                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only reference lines from this exact list of valid file+line combinations (these are the only lines GitHub will accept comments on):\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only comment on a file and line that appears in this map of valid targets. It is a JSON object keyed by file path, and each value is the list of line numbers GitHub will accept a comment on for that file. A path or line outside this map will be discarded:\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
               }]
             }' > payload.json
 
@@ -145,9 +153,15 @@ jobs:
             const fs = require('fs');
             const model = process.env.MODEL;
 
-            // Load valid lines for server-side validation
+            // Load valid lines for server-side validation.
+            // Shape is {path: [line, ...]}, grouped by file to keep the prompt small.
             const validLines = JSON.parse(fs.readFileSync('valid_lines.json', 'utf8'));
-            const validSet = new Set(validLines.map(v => `${v.path}:${v.line}`));
+            const validSet = new Set();
+            for (const [path, lines] of Object.entries(validLines)) {
+              for (const line of lines) {
+                validSet.add(`${path}:${line}`);
+              }
+            }
 
             let review;
             try {
