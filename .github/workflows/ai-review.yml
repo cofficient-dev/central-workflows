@@ -12,7 +12,9 @@ jobs:
     # once for the comment header, and the two drifted: reviews ran on glm-5.2:cloud while
     # the posted header claimed glm-5.3-flash. Declare it here so the two cannot disagree.
     env:
-      MODEL: "glm-5.3-flash"
+      # Must be the exact Ollama tag, including the :cloud suffix. This value is sent as the
+      # model in the API request, so a prettified name here fails the request outright.
+      MODEL: "glm-5.3-flash:cloud"
       # Diff cap in bytes. The prompt carries the diff plus valid_lines.json, and that JSON
       # repeats the file path for every commentable line, so it grows at roughly the same
       # rate as the diff itself. Budget about 2 bytes of prompt per byte of diff, at roughly
