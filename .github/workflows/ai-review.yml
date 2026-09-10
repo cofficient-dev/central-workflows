@@ -116,7 +116,7 @@ jobs:
               model: $model,
               messages: [{
                 role: "user",
-                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only comment on a file and line that appears in this map of valid targets. It is a JSON object keyed by file path, and each value is the list of line numbers GitHub will accept a comment on for that file. A path or line outside this map will be discarded:\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only comment on a file and line that appears in this map of valid targets. It is a JSON object keyed by file path, and each value is the list of line numbers GitHub will accept a comment on for that file. A path or line outside this map will be discarded:\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation. Your entire response must begin with the { character and end with the } character, with no preamble such as \"I'll review this diff\" and no code fence:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
               }]
             }' > payload.json
 
@@ -144,8 +144,63 @@ jobs:
           echo "$RESPONSE" | jq -r '.choices[0].message.content' > review_raw.txt
           cat review_raw.txt
 
-          # Strip any markdown fences the model may have added
-          sed 's/```json//g; s/```//g' review_raw.txt | tr -d '\r' > review.json
+          # The model does not reliably return bare JSON. glm-5.3-flash prefixes prose such as
+          # "I'll review this PR diff. Let me analyze the changes" and wraps the object in a
+          # fence, and stripping fences alone left that prose in place, so JSON.parse failed and
+          # the whole review fell back to a plain comment with no inline anchoring.
+          # Extract the first balanced JSON object instead. Brace matching has to be string
+          # aware because comment bodies legitimately contain braces, and it has to tolerate a
+          # stray brace in the preamble, so try each candidate start until one parses.
+          python3 << 'EOF'
+          import json, sys
+
+          raw = open("review_raw.txt", encoding="utf-8").read()
+
+          def extract(text, start):
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(text)):
+              ch = text[i]
+              if in_str:
+                if esc:
+                  esc = False
+                elif ch == '\\':
+                  esc = True
+                elif ch == '"':
+                  in_str = False
+                continue
+              if ch == '"':
+                in_str = True
+              elif ch == '{':
+                depth += 1
+              elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                  return text[start:i + 1]
+            return None
+
+          obj = None
+          pos = raw.find('{')
+          while pos != -1 and obj is None:
+            candidate = extract(raw, pos)
+            if candidate:
+              try:
+                obj = json.loads(candidate)
+              except json.JSONDecodeError:
+                obj = None
+            pos = raw.find('{', pos + 1)
+
+          if obj is None:
+            print("Could not extract a JSON object from the model output")
+            sys.exit(1)
+
+          with open("review.json", "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+          print(f"Extracted JSON with {len(obj.get('comments', []))} comments")
+          EOF
+
           echo "Parsed JSON:"
           cat review.json
 
