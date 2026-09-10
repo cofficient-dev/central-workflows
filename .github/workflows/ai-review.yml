@@ -105,6 +105,52 @@ jobs:
           print(f"Found {total} valid commentable lines across {len(valid_lines)} files ({size} bytes of JSON)")
           EOF
 
+      # Every run is stateless: it re-reviews the whole diff against the base with no knowledge
+      # of what was already discussed, so a push touching the same region brings resolved
+      # findings straight back. One PR saw the same finding raised five times. Collect what has
+      # already been raised so the prompt can tell the model not to repeat it.
+      - name: Collect prior findings
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        path
+                        line
+                        comments(first: 1) { nodes { body } }
+                      }
+                    }
+                  }
+                }
+              }`;
+            let threads = [];
+            try {
+              const res = await github.graphql(query, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: context.issue.number,
+              });
+              threads = res.repository.pullRequest.reviewThreads.nodes;
+            } catch (e) {
+              // never block the review on this: worst case the model repeats itself
+              console.warn(`Could not fetch prior findings: ${e.message}`);
+            }
+            const prior = threads.map((t) => ({
+              path: t.path,
+              line: t.line,
+              resolved: t.isResolved,
+              // truncated: the point is recognition, not reproduction
+              finding: (t.comments.nodes[0]?.body || '').slice(0, 300).replace(/\s+/g, ' '),
+            }));
+            fs.writeFileSync('prior_findings.json', JSON.stringify(prior));
+            console.log(`Collected ${prior.length} prior findings (${prior.filter((p) => p.resolved).length} resolved)`);
+
       - name: AI Review
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -113,11 +159,12 @@ jobs:
             --arg model "$MODEL" \
             --rawfile diff diff.txt \
             --rawfile valid_lines valid_lines.json \
+            --rawfile prior prior_findings.json \
             '{
               model: $model,
               messages: [{
                 role: "user",
-                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only comment on a file and line that appears in this map of valid targets. It is a JSON object keyed by file path, and each value is the list of line numbers GitHub will accept a comment on for that file. A path or line outside this map will be discarded:\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation. Your entire response must begin with the { character and end with the } character, with no preamble text before it and no code fence around it:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Only flag genuine issues: bugs, security problems, missing error handling, significant improvements\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
+                content: ("You are an expert code reviewer. Review this PR diff.\n\nYou MUST only comment on a file and line that appears in this map of valid targets. It is a JSON object keyed by file path, and each value is the list of line numbers GitHub will accept a comment on for that file. A path or line outside this map will be discarded:\n" + $valid_lines + "\n\nReturn ONLY a JSON object in this exact format, no markdown, no explanation. Your entire response must begin with the { character and end with the } character, with no preamble text before it and no code fence around it:\n{\n  \"summary\": \"Overall review summary\",\n  \"comments\": [\n    {\n      \"path\": \"path/to/file.js\",\n      \"line\": 42,\n      \"body\": \"Your inline comment here\"\n    }\n  ]\n}\n\nRules:\n- path and line must exactly match an entry from the valid lines list above\n- Only review and comment on files that were changed in this PR, and do NOT post inline comments on unchanged files\n- Post an inline comment ONLY when the evidence for it is visible in this diff. You are shown the diff, not the whole repository, so unchanged lines are invisible to you even inside a file that was changed. If a finding depends on code you cannot see, such as the body of a function that was not modified, a caller outside the diff, or a file not included here, do NOT assert it as an inline comment: put it in the summary, phrased as something to verify\n- Removed imports and changed signatures are the common trap here. You can see the removal but not every use of it, so ask in the summary rather than claiming a break. Do not tell the author code is broken unless the broken code is in front of you\n- Findings already raised on this pull request are listed below as JSON. Do NOT raise any of them again. A finding marked resolved:true has been fixed or answered already, and repeating it wastes the author time and buries anything new. Treat a finding as a repeat when it is the same underlying problem, even if the line number has shifted or you would word it differently. If you believe a resolved finding was not actually fixed, say so once in the summary rather than reopening it inline:\n" + $prior + "\n- No style nitpicks\n- summary should be 2-3 sentences, followed by a short \"To verify\" list if and only if you have findings that depend on code not shown in the diff\n\nDiff:\n" + $diff)
               }]
             }' > payload.json
 
