@@ -37,16 +37,51 @@ jobs:
           fetch-depth: 0
 
       - name: Get PR diff
+        id: diff
+        env:
+          ACTION: ${{ github.event.action }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff origin/${{ github.base_ref }}...HEAD > diff.txt
+          # On a push to an open PR, review only what that push changed. Re-reviewing the whole
+          # PR on every push is what dragged resolved findings back and what made the call slow,
+          # since the diff never shrinks as a PR grows.
+          #
+          # Falls back to the full PR diff whenever the incremental range cannot be trusted:
+          # the event is not a synchronize (so there is no earlier head), BEFORE is unset or the
+          # null SHA, or BEFORE is no longer reachable because a force push or rebase dropped it.
+          # Plain two-dot form on purpose: this asks what this push actually changed, rather than
+          # what changed since a merge base, which is the honest question after a force push.
+          NULL_SHA=0000000000000000000000000000000000000000
+          if [ "$ACTION" = "synchronize" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "$NULL_SHA" ] &&
+             git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "Incremental review: $BEFORE..HEAD"
+            git diff "$BEFORE" HEAD > diff.txt
+          else
+            echo "Full PR review: origin/$BASE_REF...HEAD (action=$ACTION before=${BEFORE:-none})"
+            git diff "origin/$BASE_REF...HEAD" > diff.txt
+          fi
+
           SIZE=$(wc -c < diff.txt)
           echo "Diff size: $SIZE bytes (cap $MAX_DIFF_BYTES)"
+
+          # An empty diff means the push changed nothing reviewable, for example a branch
+          # rename or a merge that brought no file changes. Skip the model call rather than
+          # spending several minutes reviewing nothing.
+          if [ ! -s diff.txt ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::No reviewable changes in this push, skipping the review"
+            exit 0
+          fi
+          echo "empty=false" >> "$GITHUB_OUTPUT"
+
           if [ $SIZE -gt $MAX_DIFF_BYTES ]; then
             head -c $MAX_DIFF_BYTES diff.txt > diff_trimmed.txt && mv diff_trimmed.txt diff.txt
             echo "::warning::Diff exceeded $MAX_DIFF_BYTES bytes and was truncated. Review is partial."
           fi
 
       - name: Parse valid diff lines
+        if: steps.diff.outputs.empty != 'true'
         run: |
           python3 << 'EOF'
           import re, json
@@ -110,6 +145,7 @@ jobs:
       # findings straight back. One PR saw the same finding raised five times. Collect what has
       # already been raised so the prompt can tell the model not to repeat it.
       - name: Collect prior findings
+        if: steps.diff.outputs.empty != 'true'
         uses: actions/github-script@v9
         with:
           script: |
@@ -152,6 +188,7 @@ jobs:
             console.log(`Collected ${prior.length} prior findings (${prior.filter((p) => p.resolved).length} resolved)`);
 
       - name: AI Review
+        if: steps.diff.outputs.empty != 'true'
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
@@ -256,7 +293,7 @@ jobs:
           cat review.json
 
       - name: Post inline review comments
-        if: success()
+        if: success() && steps.diff.outputs.empty != 'true'
         uses: actions/github-script@v9
         with:
           script: |
