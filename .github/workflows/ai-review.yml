@@ -9,8 +9,9 @@ jobs:
   review:
     runs-on: ubuntu-latest
     # A review is advisory, so it should never occupy a runner for the multi hour default.
-    # Must stay above the curl --max-time below, with room for checkout and the posting step.
-    timeout-minutes: 30
+    # Must stay above the curl budget below, which is a 300s retry window plus one 1500s
+    # attempt, with room left for checkout and the posting step.
+    timeout-minutes: 40
     # Single source of truth. This was previously declared twice, once for the API call and
     # once for the comment header, and the two drifted: reviews ran on glm-5.2:cloud while
     # the posted header claimed glm-5.3-flash. Declare it here so the two cannot disagree.
@@ -212,14 +213,29 @@ jobs:
           # 1500s, not 900s: the same 149KB prompt on this PR took 179s once and 568s another
           # time, so 900s left only about 30s of headroom on the slow end and would have failed
           # intermittently. A slow review beats a truncated or missing one.
-          RESPONSE=$(curl -s --max-time 1500 --fail-with-body https://ollama.com/v1/chat/completions \
+          # Retry transient failures. A dropped connection killed a whole review with exit 56,
+          # "failure in receiving network data", and an empty body: nothing to do with the
+          # payload, the connection simply died mid-response.
+          #
+          # --retry-all-errors is needed because curl only retries HTTP 5xx, 408 and 429 by
+          # default, not connection-level errors like 56.
+          # --retry-max-time bounds when a retry may START, not the total run. That is the
+          # property we want: a fast failure gets retried, but an attempt that has already run
+          # for ten minutes and then dies does not start another long one. Worst case is
+          # therefore 300s of retry window plus one 1500s attempt, inside the job timeout.
+          RESPONSE=$(curl -s --max-time 1500 --fail-with-body \
+            --retry 2 --retry-delay 5 --retry-all-errors --retry-max-time 300 \
+            https://ollama.com/v1/chat/completions \
             -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -H "Content-Type: application/json" \
             -d @payload.json) || CURL_EXIT=$?
 
           if [ -n "${CURL_EXIT:-}" ]; then
-            echo "curl failed with exit $CURL_EXIT after up to 1500s. Response body, if any:"
+            echo "curl failed with exit $CURL_EXIT after retries. Response body, if any:"
             echo "$RESPONSE"
+            echo "  28 = timed out against --max-time, the diff is probably too large: lower MAX_DIFF_BYTES"
+            echo "  56 = connection dropped mid-response, transient if it does not repeat"
+            echo "  22 = HTTP error, the body above should say why (bad model tag, auth, quota)"
             exit 1
           fi
 
