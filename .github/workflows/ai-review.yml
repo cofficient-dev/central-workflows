@@ -18,14 +18,15 @@ jobs:
     env:
       # Must be the exact Ollama tag, including the :cloud suffix. This value is sent as the
       # model in the API request, so a prettified name here fails the request outright.
-      MODEL: "glm-5.3-flash:cloud"
+      MODEL: "deepseek-v4.1-flash:cloud"
       # Diff cap in bytes, set by latency rather than context window: the 1M context is not the
       # binding constraint, the curl budget is.
       #
-      # Do not try to derive this from a throughput figure. Measured on one PR, glm-5.3-flash
-      # took 707s on a 366KB prompt, then 179s and 568s on the SAME 149KB prompt. Better than
-      # 3x variance on identical input, so bytes per second is noise here, and an earlier
-      # version of this comment presented exactly that arithmetic as if it were sound.
+      # Do not try to derive this from a throughput figure. During testing with glm-5.3-flash,
+      # one PR took 707s on a 366KB prompt, then 179s and 568s on the SAME 149KB prompt. Better
+      # than 3x variance on identical input, so bytes per second is noise here, and an earlier
+      # version of this comment presented exactly that arithmetic as if it were sound. These
+      # numbers are glm-specific; deepseek's latency has not been measured yet.
       #
       # 500KB is a judgement call: roughly 3x the largest diff seen in practice, kept well under
       # the context limit, and paired with a 1500s timeout to absorb the variance. Be aware that
@@ -210,9 +211,11 @@ jobs:
           # hangs, and with no timeout the step sat for minutes against the job's multi hour
           # default. --fail-with-body still gives us the response body on an HTTP error so the
           # check below can report it.
-          # 1500s, not 900s: the same 149KB prompt on this PR took 179s once and 568s another
-          # time, so 900s left only about 30s of headroom on the slow end and would have failed
-          # intermittently. A slow review beats a truncated or missing one.
+          # 1500s, not 900s: during testing with glm-5.3-flash, the same 149KB prompt took
+          # 179s once and 568s another time, so 900s left only about 30s of headroom on the
+          # slow end and would have failed intermittently. A slow review beats a truncated or
+          # missing one. deepseek's speed is untested; if it turns out much faster, this can
+          # come back down.
           # Retry transient failures. A dropped connection killed a whole review with exit 56,
           # "failure in receiving network data", and an empty body: nothing to do with the
           # payload, the connection simply died mid-response.
@@ -248,10 +251,12 @@ jobs:
           echo "$RESPONSE" | jq -r '.choices[0].message.content' > review_raw.txt
           cat review_raw.txt
 
-          # The model does not reliably return bare JSON. glm-5.3-flash prefixes prose such as
-          # "I'll review this PR diff. Let me analyze the changes" and wraps the object in a
-          # fence, and stripping fences alone left that prose in place, so JSON.parse failed and
-          # the whole review fell back to a plain comment with no inline anchoring.
+          # During testing with glm-5.3-flash the model did not reliably return bare JSON: it
+          # prefixed prose such as "I'll review this PR diff. Let me analyze the changes" and
+          # wrapped the object in a fence, and stripping fences alone left that prose in place,
+          # so JSON.parse failed and the whole review fell back to a plain comment with no
+          # inline anchoring. deepseek may behave differently, so nothing below assumes the
+          # preamble exists.
           # Extract the first balanced JSON object instead. Brace matching has to be string
           # aware because comment bodies legitimately contain braces, and it has to tolerate a
           # stray brace in the preamble, so try each candidate start until one parses.
