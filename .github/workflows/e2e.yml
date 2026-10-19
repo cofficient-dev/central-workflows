@@ -30,10 +30,17 @@ on:
         description: Testiny project id, if the suite reports to Testiny
         required: false
         type: string
+      testiny-run-title:
+        description: Testiny run title prefix (TESTINY_RUN_TITLE); package default when empty
+        required: false
+        type: string
     secrets:
       E2E_PKG_TOKEN:
         description: Read token for the private @cofficient/netsuite-e2e git dependency
         required: true
+      E2E_EXTRA_ENV:
+        description: Optional multiline KEY=value lines exported to the job env (repo-specific test settings)
+        required: false
       NS_BASE_URL:
         required: false
       NS_USERNAME:
@@ -60,8 +67,17 @@ jobs:
       TESTINY_API_KEY: ${{ secrets.TESTINY_API_KEY }}
       TESTINY_PROJECT_ID: ${{ inputs.testiny-project-id }}
       TESTINY_PROJECT_KEY: ${{ inputs.testiny-project-key }}
+      TESTINY_RUN_TITLE: ${{ inputs.testiny-run-title }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Export repo-specific env
+        env:
+          E2E_EXTRA_ENV: ${{ secrets.E2E_EXTRA_ENV }}
+        run: |
+          if [ -n "$E2E_EXTRA_ENV" ]; then
+            printf '%s\n' "$E2E_EXTRA_ENV" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' >> "$GITHUB_ENV" || true
+          fi
 
       # The private git dependency (@cofficient/netsuite-e2e) is fetched by npm
       # during `npm ci`; route git through the read token.
