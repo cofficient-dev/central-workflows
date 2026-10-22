@@ -79,9 +79,16 @@ jobs:
       - name: Export repo-specific env
         env:
           E2E_EXTRA_ENV: ${{ secrets.E2E_EXTRA_ENV }}
+        # GitHub masks a secret only as one whole string, so each value taken out of this
+        # multi-line secret is masked on its own before it reaches the job env; otherwise the
+        # runner prints it in clear in every later step's env listing.
         run: |
           if [ -n "$E2E_EXTRA_ENV" ]; then
-            printf '%s\n' "$E2E_EXTRA_ENV" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' >> "$GITHUB_ENV" || true
+            printf '%s\n' "$E2E_EXTRA_ENV" | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | while IFS= read -r line; do
+              value="${line#*=}"
+              if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+              printf '%s\n' "$line" >> "$GITHUB_ENV"
+            done
           fi
 
       # The private git dependency (@cofficient/netsuite-e2e) is fetched by npm
@@ -106,7 +113,10 @@ jobs:
       # System dependencies for the browser channel (chrome is preinstalled on
       # ubuntu-latest images; only its OS libraries are missing).
       - name: Install Playwright system dependencies
-        run: npx playwright install-deps
+        # install-deps covers system libraries only; video recording also needs Playwright's ffmpeg.
+        run: |
+          npx playwright install-deps
+          npx playwright install ffmpeg
 
       - name: Remove cached auth (force fresh login)
         if: ${{ inputs.fresh-login }}
