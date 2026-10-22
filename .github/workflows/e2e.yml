@@ -69,7 +69,12 @@ jobs:
       TESTINY_PROJECT_KEY: ${{ inputs.testiny-project-key }}
       TESTINY_RUN_TITLE: ${{ inputs.testiny-run-title }}
     steps:
+      # No persisted credentials: checkout's GITHUB_TOKEN auth header would apply to every
+      # github.com request in the workspace and override E2E_PKG_TOKEN, so npm ci could not
+      # fetch the private @cofficient/netsuite-e2e ("Repository not found").
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Export repo-specific env
         env:
