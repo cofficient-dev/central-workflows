@@ -80,9 +80,15 @@ jobs:
           fi
 
       # The private git dependency (@cofficient/netsuite-e2e) is fetched by npm
-      # during `npm ci`; route git through the read token.
+      # during `npm ci`; route git through the read token. npm writes `github:`
+      # dependencies to the lockfile as git+ssh URLs, and the runner has no SSH
+      # key, so the SSH forms are rewritten to the token as well.
       - name: Allow npm to fetch private git dependencies
-        run: git config --global url."https://x-access-token:${{ secrets.E2E_PKG_TOKEN }}@github.com/".insteadOf "https://github.com/"
+        run: |
+          base='url.https://x-access-token:${{ secrets.E2E_PKG_TOKEN }}@github.com/.insteadOf'
+          git config --global --add "$base" "https://github.com/"
+          git config --global --add "$base" "ssh://git@github.com/"
+          git config --global --add "$base" "git@github.com:"
 
       - uses: actions/setup-node@v6
         with:
