@@ -16,9 +16,9 @@ jobs:
     # once for the comment header, and the two drifted: reviews ran on glm-5.2:cloud while
     # the posted header claimed glm-5.3-flash. Declare it here so the two cannot disagree.
     env:
-      # Must be the exact Ollama tag, including the :cloud suffix. This value is sent as the
-      # model in the API request, so a prettified name here fails the request outright.
-      MODEL: "deepseek-v4.1-flash:cloud"
+      # Must be the exact Ollama tag. This value is sent as the model in the API request,
+      # so a prettified name here fails the request outright.
+      MODEL: "deepseek-v4.1-flash:1017-cloud"
       # Diff cap in bytes, set by latency rather than context window: the 1M context is not the
       # binding constraint, the curl budget is.
       #
