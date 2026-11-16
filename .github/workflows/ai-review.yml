@@ -306,7 +306,10 @@ jobs:
             candidate = extract(raw, pos)
             if candidate:
               try:
-                obj = json.loads(candidate)
+                # strict=False: deepseek put raw newlines inside comment bodies
+                # ("...clicking.<LF>"), which strict JSON rejects as control chars.
+                # json.dump below re-escapes them, so review.json stays valid.
+                obj = json.loads(candidate, strict=False)
               except json.JSONDecodeError:
                 obj = None
             pos = raw.find('{', pos + 1)
